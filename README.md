@@ -8,8 +8,9 @@ locally from your ISO.
 
 > **Status: playable.** The campaign runs from the intro through *The Pillar of
 > Autumn* and onto *Halo* at a steady 30 fps (the Xbox's own frame rate), with
-> GPU rendering in Metal at up to 4× resolution, sound and room-specific reverb,
-> keyboard/mouse and controller input, and working saves. See *Current status*.
+> GPU rendering in Metal at up to 4× resolution, sound with the Xbox audio DSP's own
+> effects (emulated), keyboard/mouse and controller input, and working saves. See
+> *Current status*.
 
 ## Quick start (macOS)
 
@@ -25,6 +26,9 @@ make recomp      # x86 -> C translation (~20 s), writes generated/
 make app         # builds build/Halo Recomp.app (first build compiles ~30 MB of C)
 make run         # launches it
 ```
+
+`make app DSP=0` builds without the audio DSP emulator (no download; the built-in reverb is
+used instead).
 
 Bring-up and debugging without a window:
 
@@ -64,12 +68,12 @@ Every Xbox control can be remapped on the **Input** page of **Settings → Setti
 - **Scaling:** fit to window, integer scale (pixel-perfect), or fill the window (crop).
 - **Screen filter** (how the picture is enlarged): nearest, bilinear, sharp bilinear (default), bicubic, Lanczos.
 - **Texture filtering** (inside the game's 3D scene): as the game sets it (default), fastest (nearest texel, no mipmaps), nearest, bilinear, trilinear, anisotropic 2×/4×/8×/16×. Smoother modes cost speed only with the CPU renderer. "Fastest" skips mipmaps and looks blocky and sparkly. Headless: `HALO_TEX_FILTER=0..8`.
-
-Recommended: screen filter **Bilinear**, texture filtering **Trilinear** (or as the game sets it), render resolution **2×** or **3×**.
 - **Scanlines**, **brightness** and **gamma**.
 - **Frame rate and speed overlay.**
 - **Renderer:** Metal (default: pixel work on the Mac's GPU) or CPU (the reference software renderer); applies at the next start. `HALO_RENDERER=cpu` forces the CPU renderer.
 - **CPU render threads** for the CPU renderer (automatic = one per core; applies at the next start).
+
+Recommended: screen filter **Bilinear**, texture filtering **Trilinear** (or as the game sets it), render resolution **2×** or **3×**.
 
 ## Audio
 
@@ -105,9 +109,10 @@ the voice methods; `HALO_APU_BINS=1` logs mix-bin use and reverb levels.
 
 ```
  Halo (USA).iso ──xiso.py──▶ default.xbe ──recomp.py──▶ generated/*.c ─┐
-                                                                      ├─ clang ─▶ Halo Recomp.app
- runtime/ (CPU model, Xbox kernel, file system, HLE) ─────────────────┤
- platform/macos/ (AppKit window, MTKView, Metal shaders, gamepad) ────┘
+                                                                      │
+ runtime/ (CPU model, Xbox kernel, file system, GPU and audio models) ─┼─ clang ─▶ Halo Recomp.app
+ platform/macos/ (AppKit window, Metal renderer, input, audio output) ─┤
+ dsp56300 JIT library (downloaded on first build, MIT) ────────────────┘
 ```
 
 | Part | What it does |
@@ -129,7 +134,8 @@ the voice methods; `HALO_APU_BINS=1` logs mix-bin use and reverb levels.
 | `runtime/mmx.h` | MMX helpers for recompiled code (used by Bink). |
 | `runtime/hle.c` | Swaps statically linked XDK functions (Direct3D, DirectSound, input) for host code, bound by address through `extracted/hle_map.txt`. |
 | `platform/macos/metal_backend.m`, `Shaders.metal` | Metal renderer: one specialized fragment shader per combiner setup (compiled in the background), GPU vertex programs, depth/stencil, polygon offset, fog, visibility queries, render scale. |
-| `platform/macos/` (other) | Native app: window and presentation, settings window, GameController and keyboard/mouse input, AVAudioEngine output, and a game thread with a 64 MB stack. |
+| `platform/macos/` (other) | Native app: window and presentation, settings window, GameController and keyboard/mouse input, AVAudioEngine output, app icon, and a game thread with a 64 MB stack. |
+| `tools/make_icon.py` | Draws the app icon (`platform/macos/AppIcon.icns`). |
 
 ### Design choices
 * **Static, ahead-of-time translation.** Every reachable guest function becomes a C function `f_XXXXXXXX(CPU*)`. Calls are direct C calls; indirect calls go through a sorted address table.
@@ -163,8 +169,9 @@ in fights and corridors; the GPU is about 3–9 % busy at 1× resolution.
 * **GPU:** register file, pushbuffer FIFO with jump/call, DMA objects via RAMHT, surfaces and
   clears, semaphores and reports, flip indices, software-method interrupts, vblank interrupts
   that follow the display's refresh.
-* **Audio:** the APU front end, voice processor and audio-memory fences; GP DSP mailbox
-  commands are acknowledged.
+* **Audio:** the APU front end, voice processor with I3DL2 filters, audio-memory fences, and
+  the GP DSP (boot from scratch memory, mix buffer, DMA controller, mailbox handled by
+  DirectSound's own DSP program). The encoder DSP (EP) is not run.
 * **Kernel:** about 120 exports, including user APCs for overlapped I/O, interrupts and DPCs,
   timers, file deletion, and the MCPX status port.
 * **Threads:** one guest lock with fair hand-off at loop back-edges.
@@ -196,3 +203,8 @@ The app writes `build/halo.log` (the previous run goes to `build/halo.prev.log`)
 Bring your own legally obtained disc image. `extracted/`, `generated/` and
 `xbox_hdd/` hold material derived from your copy: keep them private and don't
 redistribute them. This project contains no Microsoft or Bungie code or assets.
+
+The audio DSP core is [dsp56300](https://github.com/mborgerson/dsp56300) by Matt Borgerson
+(MIT licence), downloaded as a prebuilt library at build time; its licence and third-party
+notices are copied into the app bundle. Hardware details of the MCPX audio processor follow
+the [xemu](https://github.com/xemu-project/xemu) project's documentation of the chip.
