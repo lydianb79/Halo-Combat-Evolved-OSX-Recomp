@@ -71,11 +71,13 @@ ifeq ($(UNAME_S),Darwin)
 app: $(GEN)/recomp_table.c
 	@$(MAKE) --no-print-directory -j$(JOBS) app-bundle
 
-app-bundle: $(RUNTIME_OBJ) $(GEN_OBJ) platform/macos/main.m platform/macos/input.m platform/macos/input.h platform/macos/graphics.m platform/macos/graphics.h platform/macos/settings.m platform/macos/settings.h platform/macos/audio.m platform/macos/audio.h platform/macos/metal_backend.m platform/macos/metal_backend.h platform/macos/Shaders.metal platform/macos/Info.plist
+app-bundle: $(RUNTIME_OBJ) $(GEN_OBJ) platform/macos/main.m platform/macos/input.m platform/macos/input.h platform/macos/graphics.m platform/macos/graphics.h platform/macos/settings.m platform/macos/settings.h platform/macos/audio.m platform/macos/audio.h platform/macos/metal_backend.m platform/macos/metal_backend.h platform/macos/Shaders.metal platform/macos/Info.plist platform/macos/AppIcon.icns
 	@mkdir -p $(APP_Q)/Contents/MacOS $(APP_Q)/Contents/Resources
 	$(CC) $(CFLAGS) -fobjc-arc platform/macos/main.m platform/macos/input.m platform/macos/graphics.m platform/macos/settings.m platform/macos/audio.m platform/macos/metal_backend.m $(RUNTIME_OBJ) $(GEN_OBJ) -o $(APP_Q)/Contents/MacOS/HaloRecomp \
 	    $(LDLIBS) -framework Cocoa -framework Metal -framework MetalKit -framework GameController -framework QuartzCore -framework Carbon -framework AVFoundation
 	cp platform/macos/Info.plist $(APP_Q)/Contents/Info.plist
+	cp platform/macos/AppIcon.icns $(APP_Q)/Contents/Resources/AppIcon.icns
+	@touch $(APP_Q)
 	@if xcrun -sdk macosx metal -c platform/macos/Shaders.metal -o $(BUILD)/Shaders.air 2>$(BUILD)/metal.log && \
 	    xcrun -sdk macosx metallib $(BUILD)/Shaders.air -o $(APP_Q)/Contents/Resources/default.metallib 2>>$(BUILD)/metal.log; then \
 	    echo "compiled Metal shaders"; \
