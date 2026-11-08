@@ -465,6 +465,49 @@ static void reverb_process(const float *in, float *out, int n) {
  * in 7:0). The voice plays A, then B, then A again: when a slot is used up its
  * notifier (2 + 4*voice + slot) is set, its count cleared, and the game
  * refills it while the other slot plays. An empty slot starves the voice. */
+/* ------------------------------------------------------------- voice filters
+ * DirectSound puts a filter mode in CFG_MISC bits 17:16 (0 bypass, 1 DLS2,
+ * 2 parametric EQ, 3 I3DL2; 3D voices get 3) and the coefficients in
+ * TAR_FCA (0x74, from SetFilter) and TAR_FCB (0x78). For I3DL2, FCB holds
+ * two one-pole low-pass coefficients computed by DirectSound's 3D code
+ * (0x198632): bits 15:0 for the direct path, 31:16 for the reverb send.
+ * Each is a pole a in 0.16 fixed point, chosen so that the power gain at
+ * the listener's HF reference (5 kHz) matches the DirectHF / RoomHF levels
+ * (obstruction, occlusion, distance): y += (1 - a) * (x - y). 0 is no
+ * filtering, 0xFFFF fully closed. HALO_NO_VFILTER=1 turns this off. */
+#define V_MISC 0x18
+#define V_FCA  0x74
+#define V_FCB  0x78
+typedef struct { float kd, kr; float yl, yr, yrev; int on; } VFilt;
+static VFilt g_vf[MAX_VOICES];
+static int g_vf_enable = -1;
+static uint64_t g_vf_stats[4], g_vf_active;          /* voices seen per mode; voices actually filtered */
+
+static void vfilt_setup(uint32_t h) {
+    VFilt *f = &g_vf[h];
+    if (g_vf_enable < 0) g_vf_enable = !getenv("HALO_NO_VFILTER");
+    uint32_t mode = (vrd(h, V_MISC) >> 16) & 3, fcb = vrd(h, V_FCB);
+    if (g_bin_stats > 0) g_vf_stats[mode]++;
+    f->on = 0;
+    if (!g_vf_enable || mode != 3) return;
+    float ad = (float)(fcb & 0xFFFF) / 65536.0f, ar = (float)(fcb >> 16) / 65536.0f;
+    f->kd = 1.0f - ad;
+    f->kr = 1.0f - ar;
+    f->on = (fcb & 0xFFFF) != 0 || (fcb >> 16) != 0;
+    if (f->on && g_bin_stats > 0) g_vf_active++;
+}
+
+/* sl/sr: the voice's samples (filtered in place for the direct path); returns the reverb input */
+static inline float vfilt_run(VFilt *f, float *sl, float *sr, const float rev[2]) {
+    float r = *sl * rev[0] + *sr * rev[1];
+    if (!f->on) return r;
+    f->yrev += f->kr * (r - f->yrev);
+    f->yl += f->kd * (*sl - f->yl);
+    f->yr += f->kd * (*sr - f->yr);
+    *sl = f->yl; *sr = f->yr;
+    return f->yrev;
+}
+
 static void mix_stream(uint32_t h, uint32_t fmt, float step, float g[2][2], const float rev[2], float *out, int n) {
     StreamState *ss = &g_stream[h];
     uint32_t list = APU_REG(NV_PAPU_VPSSLADDR);
@@ -498,9 +541,10 @@ static void mix_stream(uint32_t h, uint32_t fmt, float step, float g[2][2], cons
         fetch(h, fmt, addr, ss->pos, &l0, &r0);
         if (ss->pos + 1 < len) fetch(h, fmt, addr, ss->pos + 1, &l1, &r1); else { l1 = l0; r1 = r0; }
         float sl0 = l0 + (l1 - l0) * frac, sr0 = r0 + (r1 - r0) * frac;
+        float rv = vfilt_run(&g_vf[h], &sl0, &sr0, rev);
         out[i * 2] += sl0 * g[0][0] + sr0 * g[1][0];
         out[i * 2 + 1] += sl0 * g[0][1] + sr0 * g[1][1];
-        g_revin[i] += sl0 * rev[0] + sr0 * rev[1];
+        g_revin[i] += rv;
         frac += step;
         while (frac >= 1.0f) { frac -= 1.0f; ss->pos++; }
         i++;
@@ -516,7 +560,10 @@ static void mix_voices(float *out, int n) {
         uint32_t st = vrd(h, V_STATE);
         if (!(st & STATE_ACTIVE) || (st & STATE_PAUSED)) continue;
         uint32_t fmt = vrd(h, V_FMT);
-        if (st & STATE_NEW) { vwr(h, V_STATE, st & ~STATE_NEW); g_frac[h] = 0; g_adpcm[h].addr = 0; }
+        if (st & STATE_NEW) {
+            vwr(h, V_STATE, st & ~STATE_NEW); g_frac[h] = 0; g_adpcm[h].addr = 0;
+            g_vf[h].yl = g_vf[h].yr = g_vf[h].yrev = 0;
+        }
         uint32_t vbin = vrd(h, V_VBIN), va = vrd(h, V_VOLA), vb = vrd(h, V_VOLB), vc = vrd(h, V_VOLC);
         uint32_t bins[8] = {vbin & 31, (vbin >> 5) & 31, (vbin >> 10) & 31, (vbin >> 16) & 31,
                             (vbin >> 21) & 31, (vbin >> 26) & 31, fmt & 31, (fmt >> 5) & 31};
@@ -548,6 +595,7 @@ static void mix_voices(float *out, int n) {
         }
         if (g_rv_level <= 0) rev[0] = rev[1] = 0;
         if (g[0][0] == 0 && g[0][1] == 0 && g[1][0] == 0 && g[1][1] == 0 && rev[0] == 0 && rev[1] == 0) continue;
+        vfilt_setup(h);
         int pitch = (int16_t)(vrd(h, V_PITCH_LINK) >> 16);
         float step = exp2f((float)pitch / 4096.0f);
         if (fmt & FMT_STREAM) { mix_stream(h, fmt, step, g, rev, out, n); continue; }
@@ -561,9 +609,10 @@ static void mix_voices(float *out, int n) {
             fetch(h, fmt, base, cbo, &l0, &r0);
             fetch(h, fmt, base, nxt, &l1, &r1);
             float sl = l0 + (l1 - l0) * frac, sr = r0 + (r1 - r0) * frac;
+            float rv = vfilt_run(&g_vf[h], &sl, &sr, rev);
             out[i * 2] += sl * g[0][0] + sr * g[1][0];
             out[i * 2 + 1] += sl * g[0][1] + sr * g[1][1];
-            g_revin[i] += sl * rev[0] + sr * rev[1];
+            g_revin[i] += rv;
             frac += step;
             while (frac >= 1.0f) {
                 frac -= 1.0f;
@@ -777,7 +826,10 @@ void apu_tick(uint64_t now_ns) {
                 char line[512]; int o = 0;
                 for (int b = 0; b < 32; b++) if (g_bin_use[b] > 0) o += snprintf(line + o, sizeof line - (size_t)o, " %d:%.0f", b, g_bin_use[b]);
                 runtime_log("[apu] mix bin use (sum of voice gains per frame):%s", o ? line : " none");
-                memset(g_bin_use, 0, sizeof g_bin_use);
+                runtime_log("[apu] filter modes (voice-frames): bypass %llu, DLS2 %llu, ParamEQ %llu, I3DL2 %llu; filtered %llu",
+                            (unsigned long long)g_vf_stats[0], (unsigned long long)g_vf_stats[1], (unsigned long long)g_vf_stats[2],
+                            (unsigned long long)g_vf_stats[3], (unsigned long long)g_vf_active);
+                memset(g_bin_use, 0, sizeof g_bin_use); memset(g_vf_stats, 0, sizeof g_vf_stats); g_vf_active = 0;
             }
         }
         memset(g_revin, 0, sizeof g_revin);
