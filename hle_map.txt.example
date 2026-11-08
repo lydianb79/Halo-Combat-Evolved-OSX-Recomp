@@ -1,0 +1,6 @@
+# Copy to extracted/hle_map.txt. One "ADDRESS NAME" per line.
+# Names with a host implementation (runtime/hle.c):
+#   Direct3D_CreateDevice  D3DDevice_Clear  D3DDevice_Swap  D3DDevice_Present
+#   D3DDevice_BlockUntilVerticalBlank
+# Addresses must be identified in YOUR default.xbe (see README, roadmap step 1).
+# 0x00000000 Direct3D_CreateDevice

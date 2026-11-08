@@ -1,0 +1,13 @@
+# derived from your own disc image — never commit or share
+extracted/
+generated/
+xbox_hdd/
+missing_seeds.txt
+build/
+*.iso
+
+# local working files
+_to_delete/
+.DS_Store
+__pycache__/
+*.log
