@@ -21,6 +21,7 @@
 #include "runtime.h"
 #include "cpu.h"
 #include "nv2a.h"
+#include "gpdsp.h"
 void nv2a_raster_vstats(void);
 #include <math.h>
 #include <stdio.h>
@@ -478,7 +479,7 @@ static void reverb_process(const float *in, float *out, int n) {
 #define V_MISC 0x18
 #define V_FCA  0x74
 #define V_FCB  0x78
-typedef struct { float kd, kr; float yl, yr, yrev; int on; } VFilt;
+typedef struct { float kd, kr; float yl, yr, yrl, yrr; int on; } VFilt;
 static VFilt g_vf[MAX_VOICES];
 static int g_vf_enable = -1;
 static uint64_t g_vf_stats[4], g_vf_active;          /* voices seen per mode; voices actually filtered */
@@ -497,18 +498,40 @@ static void vfilt_setup(uint32_t h) {
     if (f->on && g_bin_stats > 0) g_vf_active++;
 }
 
-/* sl/sr: the voice's samples (filtered in place for the direct path); returns the reverb input */
-static inline float vfilt_run(VFilt *f, float *sl, float *sr, const float rev[2]) {
-    float r = *sl * rev[0] + *sr * rev[1];
-    if (!f->on) return r;
-    f->yrev += f->kr * (r - f->yrev);
-    f->yl += f->kd * (*sl - f->yl);
-    f->yr += f->kd * (*sr - f->yr);
-    *sl = f->yl; *sr = f->yr;
-    return f->yrev;
+/* Where one voice's samples go: either folded to stereo (plus the reverb
+ * bus), or into the 32 mix bins the GP DSP reads (bins != NULL). */
+typedef struct {
+    float g[2][2];                       /* [source channel][output side] */
+    float rev[2];                        /* [source channel] -> reverb bus (bin 10) */
+    int nslot;
+    uint8_t bin[8], src[8];
+    float gain[8];
+    VFilt *f;
+    float (*bins)[32];
+} VoiceMix;
+
+static inline void emit(VoiceMix *vm, int i, float sl, float sr, float *out) {
+    float dl = sl, dr = sr, rl = sl, rr = sr;
+    VFilt *f = vm->f;
+    if (f->on) {
+        f->yl += f->kd * (sl - f->yl);  f->yr += f->kd * (sr - f->yr);
+        f->yrl += f->kr * (sl - f->yrl); f->yrr += f->kr * (sr - f->yrr);
+        dl = f->yl; dr = f->yr; rl = f->yrl; rr = f->yrr;
+    }
+    if (vm->bins) {
+        for (int k = 0; k < vm->nslot; k++) {
+            int b = vm->bin[k];
+            float v = b == 10 ? (vm->src[k] ? rr : rl) : (vm->src[k] ? dr : dl);
+            vm->bins[b][i] += v * vm->gain[k];
+        }
+        return;
+    }
+    out[i * 2] += dl * vm->g[0][0] + dr * vm->g[1][0];
+    out[i * 2 + 1] += dl * vm->g[0][1] + dr * vm->g[1][1];
+    g_revin[i] += rl * vm->rev[0] + rr * vm->rev[1];
 }
 
-static void mix_stream(uint32_t h, uint32_t fmt, float step, float g[2][2], const float rev[2], float *out, int n) {
+static void mix_stream(uint32_t h, uint32_t fmt, float step, VoiceMix *vm, float *out, int n) {
     StreamState *ss = &g_stream[h];
     uint32_t list = APU_REG(NV_PAPU_VPSSLADDR);
     if (!list) return;
@@ -540,11 +563,7 @@ static void mix_stream(uint32_t h, uint32_t fmt, float step, float g[2][2], cons
         float l0, r0, l1, r1;
         fetch(h, fmt, addr, ss->pos, &l0, &r0);
         if (ss->pos + 1 < len) fetch(h, fmt, addr, ss->pos + 1, &l1, &r1); else { l1 = l0; r1 = r0; }
-        float sl0 = l0 + (l1 - l0) * frac, sr0 = r0 + (r1 - r0) * frac;
-        float rv = vfilt_run(&g_vf[h], &sl0, &sr0, rev);
-        out[i * 2] += sl0 * g[0][0] + sr0 * g[1][0];
-        out[i * 2 + 1] += sl0 * g[0][1] + sr0 * g[1][1];
-        g_revin[i] += rv;
+        emit(vm, i, l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac, out);
         frac += step;
         while (frac >= 1.0f) { frac -= 1.0f; ss->pos++; }
         i++;
@@ -553,8 +572,9 @@ static void mix_stream(uint32_t h, uint32_t fmt, float step, float g[2][2], cons
     g_frac[h] = frac;
 }
 
-/* Mix `n` frames at 48 kHz into out[] (interleaved stereo, accumulated). */
-static void mix_voices(float *out, int n) {
+/* Mix `n` frames at 48 kHz into out[] (interleaved stereo, accumulated), or,
+ * with bins, into the 32 mix bins for the GP DSP. */
+static void mix_voices(float *out, int n, float (*bins)[32]) {
     if (!APU_REG(NV_PAPU_VPVADDR) || !APU_REG(NV_PAPU_VPSGEADDR)) return;
     for (uint32_t h = 0; h < MAX_VOICES; h++) {
         uint32_t st = vrd(h, V_STATE);
@@ -562,10 +582,10 @@ static void mix_voices(float *out, int n) {
         uint32_t fmt = vrd(h, V_FMT);
         if (st & STATE_NEW) {
             vwr(h, V_STATE, st & ~STATE_NEW); g_frac[h] = 0; g_adpcm[h].addr = 0;
-            g_vf[h].yl = g_vf[h].yr = g_vf[h].yrev = 0;
+            g_vf[h].yl = g_vf[h].yr = g_vf[h].yrl = g_vf[h].yrr = 0;
         }
         uint32_t vbin = vrd(h, V_VBIN), va = vrd(h, V_VOLA), vb = vrd(h, V_VOLB), vc = vrd(h, V_VOLC);
-        uint32_t bins[8] = {vbin & 31, (vbin >> 5) & 31, (vbin >> 10) & 31, (vbin >> 16) & 31,
+        uint32_t vbins[8] = {vbin & 31, (vbin >> 5) & 31, (vbin >> 10) & 31, (vbin >> 16) & 31,
                             (vbin >> 21) & 31, (vbin >> 26) & 31, fmt & 31, (fmt >> 5) & 31};
         uint32_t vol[8] = {(va >> 4) & 0xFFF, va >> 20, (vb >> 4) & 0xFFF, vb >> 20, (vc >> 4) & 0xFFF, vc >> 20,
                            (va & 15) | (vb & 15) << 4 | (vc & 15) << 8,
@@ -574,14 +594,15 @@ static void mix_voices(float *out, int n) {
          * bins; LFE and the effect sends (reverb etc.) are dropped. A stereo
          * voice feeds its left channel to the even slots, its right to the odd. */
         int stereo = (fmt & FMT_STEREO) != 0;
-        float g[2][2] = {{0, 0}, {0, 0}};                     /* [source channel][output side] */
-        float rev[2] = {0, 0};                                /* [source channel] send to the reverb (bin 10) */
+        VoiceMix vm = {.f = &g_vf[h], .bins = bins};
+        float (*g)[2] = vm.g, *rev = vm.rev;
         for (int i = 0; i < 8; i++) {
             float a = gain(vol[i]), L = 0, R = 0;
             if (a == 0) continue;
-            if (g_bin_stats) g_bin_use[bins[i]] += a;
-            if (bins[i] == 10) { rev[stereo ? (i & 1) : 0] += a; continue; }
-            switch (bins[i]) {
+            if (g_bin_stats > 0) g_bin_use[vbins[i]] += a;
+            vm.bin[vm.nslot] = (uint8_t)vbins[i]; vm.src[vm.nslot] = (uint8_t)(stereo ? (i & 1) : 0); vm.gain[vm.nslot++] = a;
+            if (vbins[i] == 10) { rev[stereo ? (i & 1) : 0] += a; continue; }
+            switch (vbins[i]) {
             case 0: case 6: L = 1; break;
             case 1: case 7: R = 1; break;
             case 2: L = R = 0.7071f; break;
@@ -593,12 +614,12 @@ static void mix_voices(float *out, int n) {
             g[src][0] += a * L;
             g[src][1] += a * R;
         }
-        if (g_rv_level <= 0) rev[0] = rev[1] = 0;
-        if (g[0][0] == 0 && g[0][1] == 0 && g[1][0] == 0 && g[1][1] == 0 && rev[0] == 0 && rev[1] == 0) continue;
+        if (g_rv_level <= 0 && !bins) rev[0] = rev[1] = 0;
+        if (bins ? vm.nslot == 0 : (g[0][0] == 0 && g[0][1] == 0 && g[1][0] == 0 && g[1][1] == 0 && rev[0] == 0 && rev[1] == 0)) continue;
         vfilt_setup(h);
         int pitch = (int16_t)(vrd(h, V_PITCH_LINK) >> 16);
         float step = exp2f((float)pitch / 4096.0f);
-        if (fmt & FMT_STREAM) { mix_stream(h, fmt, step, g, rev, out, n); continue; }
+        if (fmt & FMT_STREAM) { mix_stream(h, fmt, step, &vm, out, n); continue; }
         uint32_t base = vrd(h, V_BASE) & 0x00FFFFFF, lbo = vrd(h, V_LBO) & 0x00FFFFFF;
         uint32_t ebo = vrd(h, V_EBO) & 0x00FFFFFF, cbo = vrd(h, V_CBO) & 0x00FFFFFF;
         int loop = (fmt & FMT_LOOP) != 0, ended = 0;
@@ -608,11 +629,7 @@ static void mix_voices(float *out, int n) {
             uint32_t nxt = cbo >= ebo ? (loop ? lbo : cbo) : cbo + 1;
             fetch(h, fmt, base, cbo, &l0, &r0);
             fetch(h, fmt, base, nxt, &l1, &r1);
-            float sl = l0 + (l1 - l0) * frac, sr = r0 + (r1 - r0) * frac;
-            float rv = vfilt_run(&g_vf[h], &sl, &sr, rev);
-            out[i * 2] += sl * g[0][0] + sr * g[1][0];
-            out[i * 2 + 1] += sl * g[0][1] + sr * g[1][1];
-            g_revin[i] += rv;
+            emit(&vm, i, l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac, out);
             frac += step;
             while (frac >= 1.0f) {
                 frac -= 1.0f;
@@ -714,6 +731,11 @@ uint32_t apu_read(uint32_t a, int size, uint32_t mem_value) {
     (void)size;
     if (a - ACI_BASE < ACI_SIZE) return aci_read(a - ACI_BASE, mem_value);
     if (a - APU_BASE == 0x20000 + PIO_FREE) return 0x80;   /* method FIFO empty: methods run on write */
+    uint32_t o = a - APU_BASE;
+    if (o - 0x30000 < 0x10000u || o - 0x50000 < 0x10000u) {   /* GP / EP DSP memories */
+        uint32_t v;
+        if (gpdsp_mmio_read(o >= 0x50000, o & 0xFFFF, &v)) return v;
+    }
     return mem_value;
 }
 
@@ -747,6 +769,7 @@ void apu_write(uint32_t a, uint32_t v, int size) {
         }
         return;
     }
+    if (off - 0x30000 < 0x10000u || off - 0x50000 < 0x10000u) gpdsp_mmio_write(off >= 0x50000, off & 0xFFFF, v);   /* GP / EP */
     if (off >= 0x30000) {                                /* DSP memories (GP 0x30000-0x3FFFF, EP 0x50000-) */
         static int tr = -1, logged;
         if (tr < 0) tr = getenv("HALO_TRACE_GP") != NULL;
@@ -795,6 +818,13 @@ static void gp_mailbox_ack(void) {
     }
 }
 
+/* ------------------------------------------------------------- effects choice */
+static volatile int g_use_dsp = 1;                           /* Audio settings: Xbox DSP or built-in reverb */
+void apu_set_dsp_effects(int on) {
+    if (g_use_dsp != !!on) runtime_log("[apu] effects: %s", on ? "Xbox audio DSP" : "built-in reverb");
+    g_use_dsp = !!on;
+}
+
 /* ------------------------------------------------------------- clock */
 #define FRAME 32                                             /* the VP works in 32-sample frames */
 void apu_tick(uint64_t now_ns) {
@@ -805,7 +835,8 @@ void apu_tick(uint64_t now_ns) {
         const char *w = getenv("HALO_DUMP_WAV");
         if (w && (g_wav = fopen(w, "wb"))) wav_header(g_wav, 0);
     }
-    gp_mailbox_ack();
+    int dsp = g_use_dsp && gpdsp_running();
+    if (!dsp) gp_mailbox_ack();                              /* with the GP running, its own program answers */
     deliver_trap();
     {
         static uint64_t next;
@@ -833,7 +864,16 @@ void apu_tick(uint64_t now_ns) {
             }
         }
         memset(g_revin, 0, sizeof g_revin);
-        mix_voices(buf, FRAME);
+        if (dsp) {                                           /* the GP DSP mixes the bins and adds the effects */
+            static float bins[GP_BINS][GP_FRAME];
+            memset(bins, 0, sizeof bins);
+            mix_voices(buf, FRAME, bins);
+            gpdsp_submit(bins, ring_push);
+            APU_REG(NV_PAPU_XGSCNT) += FRAME;
+            done++;
+            continue;
+        }
+        mix_voices(buf, FRAME, NULL);
         if (g_bin_stats > 0) {
             static double dry, wet, sends; static uint64_t k;
             float tmp[FRAME * 2]; memset(tmp, 0, sizeof tmp);

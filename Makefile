@@ -28,7 +28,27 @@ GENFLAGS  := $(OPT) -fno-strict-aliasing -w -Iruntime -I$(GEN)
 LDLIBS    := -lm -lpthread
 JOBS      ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
-RUNTIME_SRC := runtime/runtime.c runtime/kernel.c runtime/vfs.c runtime/hle.c runtime/nv2a.c runtime/nv2a_raster.c runtime/xinput.c runtime/apu.c
+# GP audio DSP: the dsp56300 JIT emulator (MIT, github.com/mborgerson/dsp56300),
+# a prebuilt static library downloaded on first build. DSP=0 builds without it
+# (the APU then uses its built-in reverb approximation).
+DSP       ?= 1
+DSP_VER   := 0.1.3
+ifeq ($(UNAME_S),Darwin)
+DSP_ARCH  := $(if $(filter arm64,$(shell uname -m)),aarch64,x86_64)-apple-darwin
+DSP_SYS   := -framework Security
+else
+DSP_ARCH  := $(shell uname -m)-unknown-linux-gnu
+DSP_SYS   := -ldl
+endif
+DSP_DIR   := $(BUILD)/dsp56300-$(DSP_VER)-$(DSP_ARCH)
+DSP_LIB   := $(DSP_DIR)/lib/libdsp56300_emu_ffi.a
+ifeq ($(DSP),1)
+CFLAGS    += -DHALO_DSP -I$(DSP_DIR)/include
+DSP_DEP   := $(DSP_LIB)
+LDLIBS    += $(DSP_LIB) $(DSP_SYS) -lpthread -lm
+endif
+
+RUNTIME_SRC := runtime/runtime.c runtime/kernel.c runtime/vfs.c runtime/hle.c runtime/nv2a.c runtime/nv2a_raster.c runtime/xinput.c runtime/apu.c runtime/gpdsp.c
 RUNTIME_OBJ := $(RUNTIME_SRC:runtime/%.c=$(BUILD)/rt_%.o)
 GEN_SRC     := $(sort $(wildcard $(GEN)/recomp_*.c))
 GEN_OBJ     := $(patsubst $(GEN)/%.c,$(BUILD)/gen_%.o,$(GEN_SRC))
@@ -53,7 +73,7 @@ report:
 build-dirs:
 	@mkdir -p $(BUILD)
 
-$(BUILD)/rt_%.o: runtime/%.c runtime/*.h | build-dirs
+$(BUILD)/rt_%.o: runtime/%.c runtime/*.h | build-dirs $(DSP_DEP)
 	$(CC) $(CFLAGS) -O2 -c $< -o $@
 
 $(BUILD)/gen_%.o: $(GEN)/%.c $(GEN)/recomp_funcs.h runtime/cpu.h | build-dirs
@@ -77,6 +97,7 @@ app-bundle: $(RUNTIME_OBJ) $(GEN_OBJ) platform/macos/main.m platform/macos/input
 	    $(LDLIBS) -framework Cocoa -framework Metal -framework MetalKit -framework GameController -framework QuartzCore -framework Carbon -framework AVFoundation
 	cp platform/macos/Info.plist $(APP_Q)/Contents/Info.plist
 	cp platform/macos/AppIcon.icns $(APP_Q)/Contents/Resources/AppIcon.icns
+	@if [ "$(DSP)" = 1 ]; then cp $(DSP_DIR)/LICENSE $(APP_Q)/Contents/Resources/dsp56300-LICENSE.txt; cp $(DSP_DIR)/THIRDPARTY-emu $(APP_Q)/Contents/Resources/dsp56300-THIRDPARTY.txt; fi
 	@touch $(APP_Q)
 	@if xcrun -sdk macosx metal -c platform/macos/Shaders.metal -o $(BUILD)/Shaders.air 2>$(BUILD)/metal.log && \
 	    xcrun -sdk macosx metallib $(BUILD)/Shaders.air -o $(APP_Q)/Contents/Resources/default.metallib 2>>$(BUILD)/metal.log; then \
@@ -97,6 +118,13 @@ endif
 
 debug: headless
 	$(BUILD)/halo-headless --xbe $(XBE) --iso "$(ISO)" --save-root xbox_hdd --trace-kernel
+
+$(DSP_LIB):
+	@mkdir -p $(BUILD)
+	curl -fsSL https://github.com/mborgerson/dsp56300/releases/download/v$(DSP_VER)/dsp56300-$(DSP_VER)-$(DSP_ARCH).tar.gz -o $(BUILD)/dsp56300.tar.gz
+	tar xzf $(BUILD)/dsp56300.tar.gz -C $(BUILD)
+	@rm -f $(BUILD)/dsp56300.tar.gz
+	@touch $@
 
 clean:
 	rm -rf $(BUILD)

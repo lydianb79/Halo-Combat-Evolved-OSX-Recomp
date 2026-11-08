@@ -14,6 +14,7 @@
 
 #import "audio.h"
 #include "../../runtime/runtime.h"
+#include "../../runtime/gpdsp.h"
 
 static AVAudioEngine *gEngine;
 static _Atomic float gVolume = 1.0f;          // 0..1, after mute and background handling
@@ -25,6 +26,13 @@ static NSString *const kMutedKey = @"HaloAudio.muted";
 static NSString *const kBackgroundKey = @"HaloAudio.muteInBackground";
 static NSString *const kReverbKey = @"HaloAudio.reverb";
 static float gReverb = 1.0f;                     // 0..4 (shown as 0-400%)
+static NSString *const kEffectsKey = @"HaloAudio.effects";
+static int gEffects = 0;                         // 0: Xbox audio DSP, 1: built-in reverb
+
+static BOOL dsp_possible(void) {
+    const char *e = getenv("HALO_DSP");
+    return gpdsp_compiled() && !(e && *e == '0');
+}
 
 static void apply_volume(void) {
     float v = gMuted || (gMuteInBackground && !gAppActive) ? 0.0f : gUserVolume;
@@ -37,6 +45,7 @@ static void save(void) {
     [d setBool:gMuted forKey:kMutedKey];
     [d setBool:gMuteInBackground forKey:kBackgroundKey];
     [d setFloat:gReverb forKey:kReverbKey];
+    [d setInteger:gEffects forKey:kEffectsKey];
 }
 
 // Linear up to 0.75, then a smooth knee towards 1: the sum of many voices
@@ -55,6 +64,8 @@ void audio_install(void) {
     if ([d objectForKey:kBackgroundKey]) gMuteInBackground = [d boolForKey:kBackgroundKey];
     if ([d objectForKey:kReverbKey]) gReverb = [d floatForKey:kReverbKey];
     apu_set_reverb_level(gReverb);
+    gEffects = (int)[d integerForKey:kEffectsKey];
+    apu_set_dsp_effects(gEffects == 0);
     apply_volume();
 
     [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification object:nil
@@ -129,6 +140,7 @@ void audio_install(void) {
 @property(nonatomic, strong) NSTextField *volumeLabel;
 @property(nonatomic, strong) NSButton *mute, *background;
 @property(nonatomic, strong) NSSlider *reverb;
+@property(nonatomic, strong) NSPopUpButton *effects;
 @property(nonatomic, strong) NSTextField *reverbLabel;
 @end
 
@@ -160,15 +172,22 @@ static NSTextField *label(NSString *t) {
     [self.reverbLabel.widthAnchor constraintEqualToConstant:50].active = YES;
     NSStackView *rrow = [NSStackView stackViewWithViews:@[self.reverb, self.reverbLabel]];
     rrow.spacing = 8;
+    self.effects = [NSPopUpButton new];
+    [self.effects addItemsWithTitles:@[@"Xbox audio DSP (accurate)", @"Built-in reverb (lighter)"]];
+    self.effects.target = self;
+    self.effects.action = @selector(changed:);
     self.mute = [NSButton checkboxWithTitle:@"Mute" target:self action:@selector(changed:)];
     self.background = [NSButton checkboxWithTitle:@"Mute while another app is in front" target:self action:@selector(changed:)];
     NSTextField *note = [NSTextField labelWithString:
-        @"Reverb: the game's reverb sends through a built-in room reverb (the Xbox audio DSP is not emulated). 100% is the default; 0% turns it off."];
+        @"Effects: the Xbox audio DSP runs the game's own effects program (Microsoft's reverb and 3D\n"
+         "processing). The built-in reverb is a lighter approximation that follows the game's rooms;\n"
+         "the Reverb level applies to it only (100% is the default, 0% turns it off). Changes apply at once."];
     note.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
     note.textColor = NSColor.secondaryLabelColor;
     NSView *empty = NSGridCell.emptyContentView;
     NSGridView *grid = [NSGridView gridViewWithViews:@[
         @[label(@"Volume:"), row],
+        @[label(@"Effects:"), self.effects],
         @[label(@"Reverb:"), rrow],
         @[empty, self.mute],
         @[empty, self.background],
@@ -192,6 +211,10 @@ static NSTextField *label(NSString *t) {
     self.volume.doubleValue = gUserVolume;
     self.volumeLabel.stringValue = [NSString stringWithFormat:@"%d%%", (int)lround(gUserVolume * 100)];
     self.mute.state = gMuted ? NSControlStateValueOn : NSControlStateValueOff;
+    BOOL possible = dsp_possible();
+    self.effects.enabled = possible;
+    [self.effects selectItemAtIndex:possible ? gEffects : 1];
+    self.reverb.enabled = !possible || gEffects == 1;
     self.reverb.doubleValue = gReverb;
     self.reverbLabel.stringValue = [NSString stringWithFormat:@"%d%%", (int)lround(gReverb * 100)];
     self.background.state = gMuteInBackground ? NSControlStateValueOn : NSControlStateValueOff;
@@ -201,6 +224,7 @@ static NSTextField *label(NSString *t) {
     if (sender == self.volume) gUserVolume = (float)self.volume.doubleValue;
     if (sender == self.mute) gMuted = self.mute.state == NSControlStateValueOn;
     if (sender == self.reverb) { gReverb = (float)self.reverb.doubleValue; apu_set_reverb_level(gReverb); }
+    if (sender == self.effects) { gEffects = (int)self.effects.indexOfSelectedItem; apu_set_dsp_effects(gEffects == 0); }
     if (sender == self.background) gMuteInBackground = self.background.state == NSControlStateValueOn;
     apply_volume();
     save();

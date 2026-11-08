@@ -13,7 +13,8 @@ locally from your ISO.
 
 ## Quick start (macOS)
 
-Requirements: macOS 12+, Xcode or Command Line Tools (`xcode-select --install`), Python 3.
+Requirements: macOS 12+, Xcode or Command Line Tools (`xcode-select --install`), Python 3,
+and an internet connection for the first build (it downloads the DSP emulator library).
 Full Xcode is needed to precompile the Metal shader; with only the Command
 Line Tools the shader is compiled at launch instead.
 
@@ -73,24 +74,30 @@ Recommended: screen filter **Bilinear**, texture filtering **Trilinear** (or as 
 ## Audio
 
 The game's sound plays through the Mac's current output device (AVAudioEngine). The Audio page
-has **volume**, **mute**, **mute while another app is in front** (on by default) and a
-**reverb** level (0–400 %, default 100 %).
+has **volume**, **mute**, **mute while another app is in front** (on by default), the
+**effects** method and a **reverb** level for the built-in reverb (0–400 %, default 100 %).
 
 The Xbox mixes sound in hardware: DirectSound programs up to 256 voices in the MCPX audio
 processor (APU), and two DSPs add effects and encode the output. `runtime/apu.c` emulates the
-voice processor and mixes every voice straight to 48 kHz stereo: one-shot and looping
-buffers, streams (music, speech, video soundtracks), PCM and Xbox ADPCM, pitch and the
-per-speaker volumes, with 5.1 mix bins folded down to stereo. The DSPs are not emulated;
-DirectSound's commands to them are acknowledged so it never waits.
+voice processor: one-shot and looping buffers, streams (music, speech, video soundtracks),
+PCM and Xbox ADPCM, pitch, per-speaker volumes and the I3DL2 low-pass filters that
+DirectSound sets for obstruction, occlusion and distance.
 
-**Reverb** is approximated: each voice's I3DL2 send (mix bin 10) feeds a Freeverb network
-(8 combs and 4 allpasses per side, plus a pre-delay). The room follows the game: Halo's
-I3DL2 listener settings for each area (decay time, high-frequency damping, room and reverb
-levels, delays, diffusion) are read from DirectSound's listener object and mapped onto the
-reverb, with smooth transitions between areas.
+**Effects** (Settings → Audio → Effects, switchable while playing):
 
-Environment: `HALO_REVERB=0..400` (level in percent, overrides the slider),
-`HALO_REVERB_FIXED=1` (one fixed room), `HALO_TRACE_ROOM=1` (log the room settings).
+- **Xbox audio DSP** (default): `runtime/gpdsp.c` runs the APU's Global Processor, a Motorola
+  DSP56300, with DirectSound's own effects program (Microsoft's I3DL2 reverb and the 3D
+  crosstalk processing). The core is the [dsp56300](https://github.com/mborgerson/dsp56300)
+  JIT emulator by Matt Borgerson (MIT licence); the Makefile downloads its prebuilt static
+  library on the first build (`DSP=0` builds without it). The DSP runs on its own thread; its
+  5.1 result is folded to stereo (the encoder DSP, which makes Dolby Digital, is not run).
+- **Built-in reverb**: a lighter approximation. Each voice's reverb send feeds a Freeverb
+  network (8 combs and 4 allpasses per side, plus a pre-delay) whose decay, damping, level,
+  delay and diffusion follow Halo's I3DL2 room settings, with smooth transitions between areas.
+
+Environment: `HALO_DSP=0` (built-in reverb only), `HALO_TRACE_DSP=1` (DSP DMA, timing and
+level log), `HALO_REVERB=0..400` (built-in reverb level), `HALO_REVERB_FIXED=1` (one fixed
+room), `HALO_TRACE_ROOM=1` (room settings), `HALO_NO_VFILTER=1` (no voice filters).
 Headless: `HALO_DUMP_WAV=out.wav` writes everything that was mixed; `HALO_TRACE_APU=1` logs
 the voice methods; `HALO_APU_BINS=1` logs mix-bin use and reverb levels.
 
@@ -116,7 +123,8 @@ the voice methods; `HALO_APU_BINS=1` logs mix-bin use and reverb levels.
 | `runtime/vfs.c` | `D:\` served from the ISO; `C:`/`E:`/`T:`/`U:`/`Z:` and the raw config area map to `xbox_hdd/`. |
 | `runtime/nv2a.c` | GPU (NV2A) device model behind the MMIO window: pushbuffer FIFO, vblank, flips, reports. |
 | `runtime/nv2a_raster.c` | Kelvin 3D state: vertex fetch, vertex programs (SIMD CPU interpreter, and translation to Metal), register combiners, textures; hands draws to a backend through `gpu_backend.h`. |
-| `runtime/apu.c` | MCPX audio processor: voice processor, streams, ADPCM, mixing to 48 kHz stereo, reverb. |
+| `runtime/apu.c` | MCPX audio processor: voice processor, streams, ADPCM, voice filters, mix bins, built-in reverb. |
+| `runtime/gpdsp.c` | The APU's GP DSP (DirectSound's effects program) on the dsp56300 JIT: memory map, boot, DMA, mix buffer, DSP thread. |
 | `runtime/xinput.c` | Gamepad input bound to the game's XInput entry points. |
 | `runtime/mmx.h` | MMX helpers for recompiled code (used by Bink). |
 | `runtime/hle.c` | Swaps statically linked XDK functions (Direct3D, DirectSound, input) for host code, bound by address through `extracted/hle_map.txt`. |
@@ -141,7 +149,7 @@ in fights and corridors; the GPU is about 3–9 % busy at 1× resolution.
   on the GPU, register combiners become specialized shaders, plus stencil, polygon offset
   (decals), fog, visibility tests (lens flares) and render resolutions up to 4×. A CPU
   reference renderer is still available.
-* **Sound:** voices, streams and music, with room-specific reverb.
+* **Sound:** voices, streams and music, with DirectSound's own effects on the emulated audio DSP.
 * **Saves:** profiles and checkpoints go to `xbox_hdd/`; profiles can be deleted and their
   names reused.
 * **Known:** the speed overlay shows 50 % during the intro movie (the movie and its audio
@@ -172,7 +180,7 @@ The app writes `build/halo.log` (the previous run goes to `build/halo.prev.log`)
 ## Roadmap
 
 1. **CPU headroom:** run the pushbuffer on its own thread (needs D3D's progress markers in memory).
-2. **Audio:** full GP DSP emulation instead of the reverb approximation; volume envelopes and filters.
+2. **Audio:** surround output (the encoder DSP), volume envelopes, DLS2/parametric filters, HRTF.
 3. **Remaining visual glitches** as they turn up.
 4. **Guest SEH** (`RtlRaiseException`/`RtlUnwind`).
 
