@@ -129,5 +129,6 @@ $(DSP_LIB):
 clean:
 	rm -rf $(BUILD)
 
+# Everything derived from the disc except your saves (xbox_hdd/ is kept).
 distclean: clean
-	rm -rf $(GEN) extracted xbox_hdd missing_seeds.txt
+	rm -rf $(GEN) extracted missing_seeds.txt

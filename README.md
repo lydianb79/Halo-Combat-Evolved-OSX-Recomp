@@ -40,6 +40,21 @@ The app reads the disc straight from the ISO (no 3.5 GB extraction). Saves and
 the cache partition go to `xbox_hdd/`. Environment overrides: `HALO_ISO`,
 `HALO_XBE`, `HALO_SAVES`, `HALO_TRACE_KERNEL=1`, `HALO_TRACE_CALLS=1`.
 
+## Folder layout
+
+| Folder / file | What it is | Safe to delete? |
+|---|---|---|
+| `recomp/`, `runtime/`, `platform/`, `host/`, `tools/`, `Makefile`, `seeds.txt` | The project's source (what's in this repository). | No |
+| `extracted/` | `default.xbe` copied from your ISO (`make extract`). | Yes: `make extract` recreates it |
+| `generated/` | The recompiled game code, ~64 MB of C (`make recomp`). | Yes: `make recomp` recreates it |
+| `build/` | Object files, the app (`Halo Recomp.app`), the downloaded DSP library and the logs (`halo.log`, `halo.prev.log`). | Yes: `make clean`; the next `make app` rebuilds it |
+| `xbox_hdd/` | Your saves (profiles, checkpoints) and the game's cache partition. | **No**, unless you want to lose your saves |
+| `missing_seeds.txt` | Function addresses found at run time that the recompiler missed (bring-up aid). | Yes |
+
+`make clean` removes `build/`; `make distclean` also removes `extracted/`, `generated/` and
+`missing_seeds.txt`, but keeps your saves. Everything except the source is ignored by git and
+derived from your own disc, so it must stay private.
+
 ## Controls
 
 Every Xbox control can be remapped on the **Input** page of **Settings → Settings…** (⌘,): two keyboard keys or mouse buttons per control, plus one controller button or stick direction. There are also options to invert look and set the stick dead zone. Settings are saved and kept across launches; **Restore Defaults** brings back the mapping below. A connected Xbox, PlayStation or MFi controller works without setup.

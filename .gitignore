@@ -7,7 +7,6 @@ build/
 *.iso
 
 # local working files
-_to_delete/
 .DS_Store
 __pycache__/
 *.log
